@@ -60,7 +60,7 @@ def process_pdf(uploaded_file, api_key):
         texts = text_splitter.split_documents(documents)
         
         # 建立向量庫
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
         vector_store = FAISS.from_documents(texts, embeddings)
         
         os.remove(tmp_path) # 刪除暫存
