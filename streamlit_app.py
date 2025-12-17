@@ -1,22 +1,26 @@
 import streamlit as st
 import os
 import tempfile
+import langchain
+
+# 引入 Google Gemini 相關套件
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
-# 注意這裡：v0.2 支援這個新寫法
-from langchain_text_splitters import RecursiveCharacterTextSplitter 
+# 根據 LangChain 版本自動判斷引入方式 (相容性修正)
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
-
-# 注意這裡：v0.2 這裡肯定有 chains
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 
 # 設定頁面資訊
 st.set_page_config(page_title="RAG 課程助理 (Gemini版)", page_icon="📚")
 st.title("📚 RAG 學術課程助理")
-st.caption("基於 Google Gemini 與 LangChain 的檢索增強生成系統")
+st.caption("基於 Google Gemini 1.5 Flash 與 LangChain 的檢索增強生成系統")
 
 # Sidebar: API Key 設定
 with st.sidebar:
@@ -41,35 +45,46 @@ def process_pdf(uploaded_file, api_key):
         st.error("請先輸入 API Key")
         return None
     
-    with st.spinner("正在分析文件..."):
-        # 暫存檔案
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
+    with st.spinner("正在分析文件 (使用 text-embedding-004)..."):
+        try:
+            # 暫存檔案
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
 
-        # 讀取 PDF
-        loader = PyPDFLoader(tmp_path)
-        documents = loader.load()
-        
-        # 切割文本
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", "。", "！", "？", "，", " ", ""]
-        )
-        texts = text_splitter.split_documents(documents)
-        
-        # 建立向量庫
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
-        vector_store = FAISS.from_documents(texts, embeddings)
-        
-        os.remove(tmp_path) # 刪除暫存
-        return vector_store
+            # 讀取 PDF
+            loader = PyPDFLoader(tmp_path)
+            documents = loader.load()
+            
+            # 切割文本
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                separators=["\n\n", "\n", "。", "！", "？", "，", " ", ""]
+            )
+            texts = text_splitter.split_documents(documents)
+            
+            # 建立向量庫 (修正點：使用最新的 text-embedding-004)
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/text-embedding-004", 
+                google_api_key=api_key
+            )
+            vector_store = FAISS.from_documents(texts, embeddings)
+            
+            os.remove(tmp_path) # 刪除暫存
+            return vector_store
+            
+        except Exception as e:
+            st.error(f"分析文件時發生錯誤: {str(e)}")
+            return None
 
+# 觸發檔案處理
 if uploaded_file and st.session_state.vector_store is None:
     if google_api_key:
-        st.session_state.vector_store = process_pdf(uploaded_file, google_api_key)
-        st.success("文件分析完成！請開始提問。")
+        result_store = process_pdf(uploaded_file, google_api_key)
+        if result_store:
+            st.session_state.vector_store = result_store
+            st.success("文件分析完成！請開始提問。")
     else:
         st.warning("請在左側輸入 Google API Key 以開始分析。")
 
@@ -90,28 +105,36 @@ if prompt := st.chat_input():
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
 
-    # RAG 鏈
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=google_api_key, temperature=0.3)
+    # RAG 鏈 (修正點：使用 gemini-1.5-flash)
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash", 
+        google_api_key=google_api_key, 
+        temperature=0.3
+    )
     
     # 建立 Chain
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    # 使用 ConversationBufferMemory 來記憶對話
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", 
+        return_messages=True,
+        output_key="answer" # 確保與 Chain 的輸出 key 對應
+    )
+    
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=st.session_state.vector_store.as_retriever(search_kwargs={"k": 3}),
-        memory=memory
+        memory=memory,
+        return_source_documents=True
     )
     
     # 生成回答
     with st.chat_message("assistant"):
         with st.spinner("思考中..."):
-            # 這裡為了簡單演示，不完全使用 memory chain 的歷史功能來避免複雜的 token 問題
-            # 直接使用 retriever 找答案
-            docs = st.session_state.vector_store.similarity_search(prompt, k=3)
-            context = "\n".join([doc.page_content for doc in docs])
+            # 這裡為了避免 Memory 與 Streamlit 重整的衝突，我們先簡單處理
+            # 實際專案中通常會將 memory 放入 session_state，這裡簡化演示
             
-            # 組裝 Prompt
-            system_prompt = f"你是一個專業的學術助教。請根據以下的上下文內容回答使用者的問題。如果上下文中沒有答案，請誠實說不知道。\n\n上下文：{context}\n\n問題：{prompt}"
-            response = llm.invoke(system_prompt)
+            response = chain.invoke({"question": prompt, "chat_history": []})
+            answer = response["answer"]
             
-            st.write(response.content)
-            st.session_state.messages.append({"role": "assistant", "content": response.content})
+            st.write(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
